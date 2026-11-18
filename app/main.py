@@ -19,13 +19,21 @@ DESCRIPTION = """\
 Collects paginated bus temporary-suspension notices from an upstream source and
 answers stop queries for a given UTC instant.
 
-* Only a complete page set of one source version (all pages, same version and
-  revision, no conflicting duplicate announcement numbers) is published.
+* Page 1 of a collection pins an immutable source snapshot; every further page
+  is requested with that snapshot id. A scenario switch between two page
+  requests therefore cannot splice two page sets together, even when both use
+  the same `source_version`, `source_revision` and page count.
+* Only a complete page set of one source version (all pages, same version,
+  revision and snapshot, no conflicting duplicate announcement numbers) is
+  published.
+* If the source restarts and the pinned snapshot is gone, the whole batch fails;
+  previously published data stays current. Mixed data is never published.
 * Publishing is atomic: either every notice of the new version becomes current,
   or the previous version stays current untouched.
 * Versions only move forward. A collection that started earlier can never
   overwrite a newer version that finished first, and retrying the same version
-  does not republish it.
+  with identical content does not republish it. The same version label with
+  different content is a conflict.
 * Published data is stored in SQLite and survives restarts.
 """
 
@@ -69,6 +77,10 @@ class CollectResponse(BaseModel):
     detail: str
     source_version: str | None = None
     source_revision: int | None = None
+    snapshot_id: str | None = Field(
+        default=None,
+        description="Immutable source snapshot the page set was read from.",
+    )
     collected_at: str
     version: VersionOut | None = None
 
@@ -159,9 +171,10 @@ def create_app(
             },
             502: {
                 "description": (
-                    "Source unreachable, incomplete page set, version flip "
-                    "between pages, or conflicting duplicate announcement "
-                    "number. Previous data is retained."
+                    "Source unreachable, incomplete page set, page-set or "
+                    "snapshot flip between pages, snapshot no longer available "
+                    "after a source restart, or conflicting duplicate "
+                    "announcement number. Previous data is retained."
                 )
             },
         },
@@ -173,6 +186,7 @@ def create_app(
             "detail": result.detail,
             "source_version": result.source_version,
             "source_revision": result.source_revision,
+            "snapshot_id": result.snapshot_id,
             "collected_at": result.collected_at,
         }
         if result.version is not None:

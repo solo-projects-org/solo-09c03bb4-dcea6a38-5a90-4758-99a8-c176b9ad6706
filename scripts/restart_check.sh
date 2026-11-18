@@ -32,4 +32,27 @@ fi
 
 echo "== query after restart"
 curl -fsS "$API/api/v1/announcements?stop_id=STOP-001&at=2026-11-17T09:00:00Z" | python3 -m json.tool
-echo "PASS: published data survived restart"
+
+echo "== restarting source and re-collecting the same page set"
+# A restarted source serves the same file-backed scenario under a new snapshot
+# id. Re-collecting it must not change which version is current.
+docker compose restart source >/dev/null
+for _ in $(seq 1 30); do
+  if curl -fsS "$SOURCE/health" >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+RESULT="$(curl -fsS -X POST "$API/api/v1/collect")"
+echo "$RESULT" | python3 -m json.tool
+echo "$RESULT" | python3 -c '
+import json, sys
+body = json.load(sys.stdin)
+assert body["status"] in ("already_current", "published"), body
+print("PASS: post-restart collection status", body["status"])
+'
+AFTER_SOURCE_RESTART="$(curl -fsS "$API/api/v1/current-version")"
+echo "$AFTER_SOURCE_RESTART"
+if [ "$BEFORE" != "$AFTER_SOURCE_RESTART" ]; then
+  echo "FAIL: current version changed after re-collecting a restarted source" >&2
+  exit 1
+fi
+echo "PASS: published data survived restart; re-collection did not roll it back"

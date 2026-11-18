@@ -1,7 +1,16 @@
-"""Collector that fetches every page of one source version and publishes it."""
+"""Collector that fetches every page of one source snapshot and publishes it.
+
+The source hands out an immutable ``snapshot_id`` with page 1. Every following
+page is requested with that id, so a scenario switch between two page requests
+can never splice an old and a new page set together — even when both scenarios
+use the same ``source_version``, ``source_revision`` and page count. If the
+source has restarted (or evicted the snapshot) the continuation request fails
+and the whole batch is rejected; mixed data is never published.
+"""
 
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -10,7 +19,7 @@ import httpx
 from pydantic import ValidationError
 
 from .config import Settings
-from .db import Database, PublishedVersion, PublishConflict
+from .db import Database, PublishConflict, PublishedVersion
 from .models import (
     CandidateSet,
     DuplicateAnnouncementError,
@@ -23,6 +32,14 @@ from .models import (
 class SourceError(RuntimeError):
     """The upstream source is unreachable or violates the page contract."""
 
+    def __init__(self, message: str, *, snapshot_id: str | None = None) -> None:
+        super().__init__(message)
+        self.snapshot_id = snapshot_id
+
+
+class SnapshotUnavailableError(SourceError):
+    """The snapshot a collection started from no longer exists at the source."""
+
 
 @dataclass
 class CollectionResult:
@@ -31,12 +48,34 @@ class CollectionResult:
     detail: str
     source_version: str | None = None
     source_revision: int | None = None
+    snapshot_id: str | None = None
     version: PublishedVersion | None = None
     collected_at: str = field(default_factory=utc_now_iso)
 
 
 class PageFetcher(Protocol):
-    def fetch_page(self, page: int) -> "SourcePage | dict": ...
+    def fetch_page(
+        self, page: int, snapshot_id: str | None = None
+    ) -> SourcePage | dict: ...
+
+
+def _accepts_snapshot_argument(function: object) -> bool:
+    """Whether a fetch implementation can be called with ``snapshot_id``.
+
+    Page fetchers written before snapshots existed only take ``page``. They
+    keep working in best-effort label-consistency mode; snapshot-aware
+    fetchers get the token. Only the signature is inspected, so a genuine
+    ``TypeError`` raised *inside* a fetch is never mistaken for "this fetcher
+    does not support snapshots".
+    """
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):  # pragma: no cover - builtins
+        return False
+    return "snapshot_id" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 class HttpPageFetcher:
@@ -44,17 +83,29 @@ class HttpPageFetcher:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
 
-    def fetch_page(self, page: int) -> dict:
+    def fetch_page(self, page: int, snapshot_id: str | None = None) -> dict:
         url = f"{self.base_url}/announcements"
+        params: dict[str, object] = {"page": page}
+        if snapshot_id:
+            params["snapshot"] = snapshot_id
         try:
             response = httpx.get(
                 url,
-                params={"page": page},
+                params=params,
                 timeout=self.timeout_seconds,
                 follow_redirects=False,
             )
         except httpx.HTTPError as exc:
-            raise SourceError(f"page {page}: source request failed: {exc}") from exc
+            raise SourceError(
+                f"page {page}: source request failed: {exc}", snapshot_id=snapshot_id
+            ) from exc
+        if response.status_code == 410:
+            raise SnapshotUnavailableError(
+                f"page {page}: snapshot {snapshot_id!r} is no longer available at "
+                "the source (it restarted or evicted the snapshot); "
+                "refusing to mix pages from different page sets",
+                snapshot_id=snapshot_id,
+            )
         if response.status_code != 200:
             raise SourceError(
                 f"page {page}: source returned HTTP {response.status_code}"
@@ -68,7 +119,7 @@ class HttpPageFetcher:
         return payload
 
 
-def _parse_page(raw: "SourcePage | dict", page: int) -> SourcePage:
+def _parse_page(raw: SourcePage | dict, page: int) -> SourcePage:
     if isinstance(raw, SourcePage):
         parsed = raw
     else:
@@ -83,46 +134,71 @@ def _parse_page(raw: "SourcePage | dict", page: int) -> SourcePage:
     return parsed
 
 
+def _fetch_page(fetcher: PageFetcher, page: int, snapshot_id: str | None) -> dict:
+    method = fetcher.fetch_page
+    if _accepts_snapshot_argument(getattr(method, "__func__", method)):
+        return method(page, snapshot_id=snapshot_id)
+    return method(page)
+
+
 def fetch_complete_page_set(fetcher: PageFetcher, max_pages: int) -> CandidateSet:
-    """Fetch pages 1..total_pages, enforcing one consistent version per set."""
-    first = _parse_page(fetcher.fetch_page(1), 1)
+    """Fetch pages 1..total_pages from one immutable source snapshot.
+
+    Page 1 starts the page set and returns the snapshot token. Every further
+    page is requested with that token, and the token is re-checked on every
+    response. Snapshot ids are mandatory for multi-page sets when the source
+    provides them; sources that predate the snapshot contract are still
+    accepted in label-consistency mode.
+    """
+    first = _parse_page(_fetch_page(fetcher, 1, None), 1)
     total_pages = first.total_pages
     if total_pages > max_pages:
         raise SourceError(
             f"source reports {total_pages} pages, above the configured limit of {max_pages}"
         )
 
+    snapshot_id = first.snapshot_id
     pages = [first]
+
+    def fail(message: str) -> SourceError:
+        return SourceError(message, snapshot_id=snapshot_id)
+
     for page_no in range(2, total_pages + 1):
-        page = _parse_page(fetcher.fetch_page(page_no), page_no)
+        page = _parse_page(_fetch_page(fetcher, page_no, snapshot_id), page_no)
+        if page.snapshot_id != snapshot_id:
+            raise fail(
+                "page set changed snapshot mid-collection: "
+                f"page 1 is snapshot {snapshot_id!r}, page {page_no} is "
+                f"snapshot {page.snapshot_id!r}"
+            )
         if page.source_version != first.source_version:
-            raise SourceError(
+            raise fail(
                 "page set changed version mid-collection: "
                 f"page 1 is {first.source_version!r}, page {page_no} is "
                 f"{page.source_version!r}"
             )
         if page.source_revision != first.source_revision:
-            raise SourceError(
+            raise fail(
                 "page set changed revision mid-collection: "
                 f"page 1 is revision {first.source_revision}, page {page_no} is "
                 f"revision {page.source_revision}"
             )
         if page.total_pages != total_pages:
-            raise SourceError(
+            raise fail(
                 "page set changed total_pages mid-collection: "
                 f"page 1 says {total_pages}, page {page_no} says {page.total_pages}"
             )
         pages.append(page)
 
     if len(pages) != total_pages:
-        raise SourceError(
+        raise fail(
             f"incomplete page set: expected {total_pages} pages, received {len(pages)}"
         )
 
     try:
         return build_candidate(pages)
     except DuplicateAnnouncementError as exc:
-        raise SourceError(str(exc)) from exc
+        raise fail(str(exc)) from exc
 
 
 class Collector:
@@ -147,6 +223,7 @@ class Collector:
                 status="failed",
                 http_status=502,
                 detail=str(exc),
+                snapshot_id=getattr(exc, "snapshot_id", None),
                 collected_at=utc_now_iso(),
             )
 
@@ -167,6 +244,7 @@ class Collector:
                 detail=str(exc),
                 source_version=candidate.source_version,
                 source_revision=candidate.source_revision,
+                snapshot_id=candidate.snapshot_id,
                 collected_at=utc_now_iso(),
             )
 
@@ -180,6 +258,7 @@ class Collector:
             ),
             source_version=candidate.source_version,
             source_revision=candidate.source_revision,
+            snapshot_id=candidate.snapshot_id,
             version=version,
             collected_at=utc_now_iso(),
         )

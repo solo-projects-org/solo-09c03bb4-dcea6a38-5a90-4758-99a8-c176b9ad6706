@@ -35,6 +35,11 @@ class Checker:
         response.raise_for_status()
         return response.json()
 
+    def source_snapshot_id(self) -> str:
+        response = httpx.get(f"{self.source}/announcements", params={"page": 1}, timeout=10)
+        response.raise_for_status()
+        return response.json()["snapshot_id"]
+
     def collect(self) -> tuple[int, dict]:
         response = httpx.post(f"{self.api}/api/v1/collect", timeout=30)
         return response.status_code, response.json()
@@ -115,7 +120,56 @@ class Checker:
             "old data retained after stale revision",
         )
 
-        print("6. restart durability is checked separately (scripts/restart_check.sh)")
+        print("6. snapshot handover: same labels, different content")
+        self.switch("handoff_a")
+        status, body = self.collect()
+        self.check(
+            status == 200 and body["status"] == "published",
+            "handoff_a published",
+        )
+        self.check(
+            bool(body.get("snapshot_id")),
+            "collect response exposes the snapshot it read",
+        )
+        a_snapshot = body.get("snapshot_id")
+
+        self.switch("handoff_b")
+        new_snapshot = self.source_snapshot_id()
+        self.check(
+            new_snapshot != a_snapshot,
+            "switch freezes a new snapshot even though labels are identical",
+        )
+        status, body = self.collect()
+        self.check(
+            status == 409 and body["status"] == "failed",
+            "same version label with different content is a conflict",
+        )
+        current = httpx.get(f"{self.api}/api/v1/current-version", timeout=10).json()
+        self.check(
+            current["source_version"] == "2026-11-17T10:00:00Z",
+            "old (handoff_a) data retained after conflict",
+        )
+        hit = self.query("STOP-010", "2026-11-17T11:00:00Z")
+        self.check(
+            [item["announcement_no"] for item in hit["announcements"]] == ["A-4001"],
+            "no handoff_b notice leaked into the published version",
+        )
+
+        print("7. same content under a fresh snapshot is not republished")
+        # Switching back to handoff_a freezes a new snapshot id but the same
+        # content and labels; that must be an idempotent no-op.
+        self.switch("handoff_a")
+        status, body = self.collect()
+        self.check(
+            status == 200 and body["status"] == "already_current",
+            "identical content under a new snapshot is not republished",
+        )
+        self.check(
+            body.get("snapshot_id") != a_snapshot,
+            "the retry read a fresh snapshot id",
+        )
+
+        print("8. restart durability is checked separately (scripts/restart_check.sh)")
         return 1 if self.failures else 0
 
 

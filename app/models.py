@@ -81,12 +81,20 @@ class SourceAnnouncement(BaseModel):
 
 
 class SourcePage(BaseModel):
-    """One page returned by the paginated announcement source."""
+    """One page returned by the paginated announcement source.
+
+    ``snapshot_id`` identifies the immutable snapshot the page was served
+    from. It is optional for backwards compatibility with label-only sources,
+    but the collector requires it as soon as a page set spans more than one
+    page — otherwise a mid-collection scenario switch could silently mix two
+    different page sets that happen to share version/revision/page count.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
     source_version: str = Field(min_length=1, max_length=200)
     source_revision: int = Field(default=0, ge=0)
+    snapshot_id: str | None = Field(default=None, min_length=1, max_length=200)
     page: int = Field(ge=1)
     total_pages: int = Field(ge=1)
     announcements: list[SourceAnnouncement]
@@ -97,6 +105,15 @@ class SourcePage(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("source_version must not be blank")
+        return value
+
+    @field_validator("snapshot_id", mode="before")
+    @classmethod
+    def _normalise_snapshot_id(cls, value: object) -> object:
+        """Treat a blank snapshot id as "no snapshot" rather than invalid JSON."""
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
         return value
 
 
@@ -144,6 +161,7 @@ class CandidateSet:
     total_pages: int
     announcements: tuple[Announcement, ...]
     content_hash: str
+    snapshot_id: str | None = None
 
     @property
     def ordering_key(self) -> tuple[int, str]:
@@ -204,6 +222,7 @@ def build_candidate(pages: list[SourcePage]) -> CandidateSet:
         total_pages=first.total_pages,
         announcements=ordered,
         content_hash=content_hash(ordered),
+        snapshot_id=first.snapshot_id,
     )
 
 

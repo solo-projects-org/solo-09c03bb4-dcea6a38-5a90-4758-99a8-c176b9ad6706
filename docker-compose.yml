@@ -28,6 +28,9 @@ services:
     environment:
       SCENARIO_DIR: /srv/mock_source/scenarios
       DEFAULT_SCENARIO: v1
+      # How many frozen snapshots stay readable after a switch. Larger than the
+      # number of in-flight collections; eviction makes continuations fail 410.
+      SNAPSHOT_HISTORY: "128"
     volumes:
       # Mounted read-only so new scenario files can be added and switched to
       # with POST /scenario without rebuilding the image.
