@@ -1,0 +1,38 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: api.Dockerfile
+    image: transit-collector-api:local
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DATABASE_PATH: /srv/data/transit.db
+      SOURCE_BASE_URL: http://source:8001
+      SOURCE_TIMEOUT_SECONDS: "10"
+      MAX_SOURCE_PAGES: "200"
+    volumes:
+      - transit-data:/srv/data
+    depends_on:
+      source:
+        condition: service_healthy
+    restart: unless-stopped
+
+  source:
+    build:
+      context: .
+      dockerfile: source.Dockerfile
+    image: transit-mock-source:local
+    ports:
+      - "${SOURCE_PORT:-8001}:8001"
+    environment:
+      SCENARIO_DIR: /srv/mock_source/scenarios
+      DEFAULT_SCENARIO: v1
+    volumes:
+      # Mounted read-only so new scenario files can be added and switched to
+      # with POST /scenario without rebuilding the image.
+      - ./mock_source/scenarios:/srv/mock_source/scenarios:ro
+    restart: unless-stopped
+
+volumes:
+  transit-data:

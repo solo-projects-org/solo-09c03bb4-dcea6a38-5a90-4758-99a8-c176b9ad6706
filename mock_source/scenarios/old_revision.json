@@ -1,0 +1,15 @@
+{
+  "scenario": "old_revision",
+  "mode": "normal",
+  "source_version": "2026-11-17T05:00:00Z",
+  "source_revision": 1,
+  "page_size": 2,
+  "announcements": [
+    {
+      "announcement_no": "A-0900",
+      "stop_id": "STOP-001",
+      "start_utc": "2026-11-17T06:00:00Z",
+      "end_utc": "2026-11-17T07:00:00Z"
+    }
+  ]
+}
